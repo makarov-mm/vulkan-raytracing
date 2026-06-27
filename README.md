@@ -9,8 +9,6 @@ software tracer.
 Zero external dependencies beyond the Vulkan SDK itself: the window is created
 with raw Win32 (no GLFW) and all math is inline (no GLM).
 
-## Screenshot
-
 ![preview](preview.png)
 
 ## Features
@@ -19,19 +17,23 @@ with raw Win32 (no GLFW) and all math is inline (no GLM).
   closest-hit and two miss shaders) and a correctly aligned shader binding table.
 - **Reflections** — traced iteratively from the ray-gen shader, so
   `maxPipelineRayRecursionDepth = 1`, which every RT-capable GPU supports.
-- **Temporal accumulation + anti-aliasing** — each frame casts one jittered
-  sample per pixel and blends it into an `R32G32B32A32_SFLOAT` accumulation
-  buffer. While the camera is still the image progressively refines to a clean,
-  noise-free result; it resets the moment the camera moves.
-- **Soft shadows** — the shadow ray is sampled inside a cone around the light, so
-  shadows have a real penumbra that sharpens as the accumulation converges.
-- **Glass / refraction** — the central sphere is dielectric glass with
-  Fresnel-weighted reflection and refraction (Schlick), including total internal
-  reflection. The Fresnel split is importance-sampled, so it is unbiased.
+- **Temporal accumulation + anti-aliasing** — each frame casts several jittered
+  samples per pixel (4 by default) and blends the result into an
+  `R32G32B32A32_SFLOAT` accumulation buffer. The multi-sampling keeps motion
+  smooth, and while the camera is still the image progressively refines to a
+  clean, noise-free result; it resets the moment the camera moves.
+- **Soft shadows from an area light** — the scene is lit by a spherical area
+  light (a visible emissive sphere). Each shading point samples the cone the light
+  subtends, so the penumbra widens with the occluder's distance, like real soft
+  shadows, and sharpens as the accumulation converges.
+- **Glass with chromatic dispersion** — the central sphere is dielectric glass
+  with Fresnel-weighted reflection and refraction (Schlick) and total internal
+  reflection. Refraction uses a different IOR per colour channel via spectral
+  (hero-wavelength) sampling, so the glass splits light into faint rainbow edges.
 
 The scene is a reflective checkerboard floor, a central glass sphere and a ring of
-six coloured spheres (some matte, some reflective), lit by a single directional
-light.
+six coloured spheres (some matte, some reflective), lit by a spherical area light
+that is itself visible in the scene and in reflections.
 
 ## Controls
 
@@ -92,5 +94,9 @@ shaders/shadow.rmiss         shadow miss (point is lit)
   shader qualifier) copied to the swapchain with `vkCmdBlitImage`, which maps
   colour components by name, so colours stay correct whether the swapchain is
   RGBA or BGRA.
-- Accumulation quality knobs live in `shaders/raygen.rgen` (bounce count, light
-  cone angle, IOR) and in `updateUniforms` on the host.
+- Quality / look knobs: `shaders/raygen.rgen` holds the bounce count, the
+  per-channel `IOR_R/G/B` (widen the spread for stronger dispersion), and the
+  emissive light brightness. `updateUniforms` on the host sets the light position,
+  the light radius (`lightPos[3]` — bigger = softer shadows), the intensity, and
+  `params[3]`, the number of samples cast per frame (raise it for smoother motion,
+  lower it for more speed on weaker GPUs).

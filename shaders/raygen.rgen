@@ -6,8 +6,8 @@ layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
 layout(binding = 2, set = 0) uniform CameraProperties {
     mat4 viewInverse;
     mat4 projInverse;
-    vec4 lightDir;   // xyz = direction the light travels
-    vec4 params;     // x = time, y = maxBounces, z = cos(light cone half-angle)
+    vec4 lightPos;   // xyz = position, w = radius (area light)
+    vec4 params;     // x = time, y = maxBounces, z = light intensity, w = samples per frame
     uvec4 frame;     // x = accumulated frame index (0 on camera move)
 } cam;
 layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
@@ -17,13 +17,16 @@ struct HitPayload {
     vec3  normal;       // faces against the incoming ray
     vec3  albedo;
     float reflectivity;
-    float matId;        // 0 = floor, 1 = solid, 2 = glass
+    float matId;        // 0 = floor, 1 = solid, 2 = glass, 3 = emissive light
     float t;            // < 0 means miss
     float frontFace;    // 1 = ray hit the outer surface, 0 = inside
 };
 
 layout(location = 0) rayPayloadEXT HitPayload payload;
 layout(location = 1) rayPayloadEXT float      shadowed;
+
+// Per-channel IOR for chromatic dispersion (exaggerated for visibility).
+const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
 
 // ---------------------------------------------------------------------------
 //  PCG random number generator
@@ -60,18 +63,18 @@ vec3 sampleCone(vec3 dir, float cosThetaMax, inout uint seed) {
     vec3 t, b; basis(dir, t, b);
     return normalize(t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + dir * cosT);
 }
-float traceShadow(vec3 origin, vec3 L) {
+float traceShadow(vec3 origin, vec3 L, float tmax) {
     shadowed = 1.0;
     traceRayEXT(topLevelAS,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        0xFF, 0, 0, 1, origin, 0.001, L, 10000.0, 1);
+        0xFF, 0, 0, 1, origin, 0.001, L, tmax, 1);
     return shadowed;
 }
 
-void main() {
-    uint seed = (gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + cam.frame.x * 26699u) | 1u;
-
-    // Sub-pixel jitter -> anti-aliasing once accumulated.
+// ---------------------------------------------------------------------------
+//  Trace one full path for one (jittered) sample.
+// ---------------------------------------------------------------------------
+vec3 renderSample(inout uint seed, int sampleIdx) {
     vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
     vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
     vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
@@ -81,14 +84,17 @@ void main() {
     vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
     vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
 
-    vec3  L           = normalize(-cam.lightDir.xyz);
-    int   maxBounces  = int(cam.params.y);
-    float cosThetaMax = cam.params.z;
-    const float eps   = 0.001;
-    const float IOR   = 1.5;
+    int   maxBounces = int(cam.params.y);
+    float intensity  = cam.params.z;
+    const float eps  = 0.001;
 
     vec3 color      = vec3(0.0);
     vec3 throughput = vec3(1.0);
+
+    // Spectral channel is fixed per sample (stratified), so over a frame each
+    // R/G/B channel gets an equal share -> dispersion with no channel noise.
+    int  hero      = sampleIdx % 3;     // 0 = R, 1 = G, 2 = B
+    bool dispersed = false;
 
     for (int bounce = 0; bounce <= maxBounces; ++bounce) {
         payload.t = 0.0;
@@ -100,36 +106,55 @@ void main() {
         vec3 N   = normalize(payload.normal);
         int  mat = int(payload.matId + 0.5);
 
-        // ---- Glass: Fresnel-weighted reflect / refract --------------------
+        // ---- Emissive area light: see the source directly ------------------
+        if (mat == 3) {
+            color += throughput * payload.albedo * 3.0;
+            break;
+        }
+
+        // ---- Glass: dispersive Fresnel reflect / refract ------------------
         if (mat == 2) {
-            float eta  = (payload.frontFace > 0.5) ? (1.0 / IOR) : IOR;
+            float ior = (hero == 0) ? IOR_R : (hero == 1) ? IOR_G : IOR_B;
+            float eta = (payload.frontFace > 0.5) ? (1.0 / ior) : ior;
+
             float cosI = clamp(dot(-dir, N), 0.0, 1.0);
-            float R0   = (1.0 - IOR) / (1.0 + IOR); R0 *= R0;
+            float R0   = (1.0 - 1.52) / (1.0 + 1.52); R0 *= R0;
             float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
 
             vec3 refr = refract(dir, N, eta);
             bool tir  = dot(refr, refr) < 1e-6;
 
-            // Importance-sample the Fresnel term: unbiased, so no reweighting.
             if (tir || rnd(seed) < fres) {
                 dir    = reflect(dir, N);
-                origin = payload.hitPos + N * eps;
+                origin = payload.hitPos + N * eps;          // reflection stays full-colour
             } else {
                 dir    = normalize(refr);
                 origin = payload.hitPos - N * eps;
+                if (!dispersed) {                            // collapse to the hero channel
+                    vec3 mask = (hero == 0) ? vec3(1,0,0)
+                              : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
+                    throughput *= 3.0 * mask;
+                    dispersed = true;
+                }
             }
-            throughput *= vec3(0.95, 0.97, 1.00); // subtle glass tint
+            throughput *= vec3(0.98); // very light absorption
             continue;
         }
 
         // ---- Floor / solid object -----------------------------------------
         vec3 albedo = (mat == 0) ? checker(payload.hitPos) : payload.albedo;
 
-        // Soft shadow: one cone sample per frame; accumulation builds the penumbra.
-        vec3  Ls   = sampleCone(L, cosThetaMax, seed);
-        float sh   = traceShadow(payload.hitPos + N * eps, Ls);
-        float diff = max(dot(N, Ls), 0.0) * (1.0 - sh);
-        vec3  local = albedo * (0.15 + diff);
+        // Area light: cone subtended by the light sphere -> distance-dependent penumbra.
+        vec3  toLight = cam.lightPos.xyz - payload.hitPos;
+        float dist    = length(toLight);
+        vec3  Lc      = toLight / dist;
+        float sinMax  = clamp(cam.lightPos.w / dist, 0.0, 0.999);
+        float cosMax  = sqrt(1.0 - sinMax * sinMax);
+        vec3  Ls      = sampleCone(Lc, cosMax, seed);
+
+        float sh   = traceShadow(payload.hitPos + N * eps, Ls, dist - cam.lightPos.w * 1.001);
+        float diff = max(dot(N, Ls), 0.0) * (1.0 - sh) * intensity;
+        vec3  local = albedo * (0.12 + diff);
 
         float refl = payload.reflectivity;
         color += throughput * local * (1.0 - refl);
@@ -139,6 +164,20 @@ void main() {
         dir    = reflect(dir, N);
         origin = payload.hitPos + N * eps;
     }
+    return color;
+}
+
+void main() {
+    int spp = max(1, int(cam.params.w));
+
+    vec3 color = vec3(0.0);
+    for (int s = 0; s < spp; ++s) {
+        uint seed = (gl_LaunchIDEXT.x * 1973u
+                   + gl_LaunchIDEXT.y * 9277u
+                   + (cam.frame.x * uint(spp) + uint(s)) * 26699u) | 1u;
+        color += renderSample(seed, s);
+    }
+    color /= float(spp);
 
     // ---- Temporal accumulation --------------------------------------------
     ivec2 pix = ivec2(gl_LaunchIDEXT.xy);

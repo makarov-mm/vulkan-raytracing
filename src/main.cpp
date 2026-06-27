@@ -30,8 +30,8 @@
 // -----------------------------------------------------------------------------
 //  Small helpers
 // -----------------------------------------------------------------------------
-static const uint32_t WIDTH  = 800;
-static const uint32_t HEIGHT = 800;
+static const uint32_t WIDTH  = 1280;
+static const uint32_t HEIGHT = 720;
 
 #ifdef NDEBUG
 static const bool kEnableValidation = false;
@@ -142,9 +142,9 @@ struct Vertex {
 struct UBO {
     Mat4     viewInverse;
     Mat4     projInverse;
-    float    lightDir[4];
-    float    params[4];   // x = time, y = maxBounces, z = cos(light cone half-angle)
-    uint32_t frame[4];    // x = accumulated frame index
+    float    lightPos[4];  // xyz = position, w = radius (area light)
+    float    params[4];    // x = time, y = maxBounces, z = light intensity, w = samples/frame
+    uint32_t frame[4];     // x = accumulated frame index
 };
 
 // -----------------------------------------------------------------------------
@@ -725,6 +725,9 @@ private:
             addSphere(c, 0.8f, palette[i], refl);
         }
 
+        // Visible area light (emissive). Must match lightPos/radius in updateUniforms.
+        addSphere({ 4.0f, 7.0f, -2.0f }, 1.6f, { 1.0f, 0.95f, 0.85f }, 0.0f, 3.0f);
+
         indexCount = (uint32_t)sceneIndices.size();
 
         VkBufferUsageFlags geomUsage =
@@ -1193,11 +1196,12 @@ private:
         UBO data{};
         data.viewInverse = inverse(view);
         data.projInverse = inverse(proj);
-        Vec3 ld = normalize({ -0.6f, -1.0f, -0.4f });
-        data.lightDir[0] = ld.x; data.lightDir[1] = ld.y; data.lightDir[2] = ld.z; data.lightDir[3] = 0;
+        data.lightPos[0] = 4.0f; data.lightPos[1] = 7.0f; data.lightPos[2] = -2.0f;
+        data.lightPos[3] = 1.6f;      // light sphere radius (bigger = softer shadows)
         data.params[0] = t;
         data.params[1] = 8.0f;        // max bounces (glass needs a few)
-        data.params[2] = 0.9945f;     // cos(~6 deg): light cone half-angle -> soft shadows
+        data.params[2] = 1.4f;        // light intensity
+        data.params[3] = 6.0f;        // samples/frame (multiple of 3 for even dispersion)
         data.frame[0]  = accumFrame;
         uploadToBuffer(ubo, &data, sizeof(data));
     }
