@@ -1,0 +1,156 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec4 lightDir;   // xyz = direction the light travels
+    vec4 params;     // x = time, y = maxBounces, z = cos(light cone half-angle)
+    uvec4 frame;     // x = accumulated frame index (0 on camera move)
+} cam;
+layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
+
+struct HitPayload {
+    vec3  hitPos;
+    vec3  normal;       // faces against the incoming ray
+    vec3  albedo;
+    float reflectivity;
+    float matId;        // 0 = floor, 1 = solid, 2 = glass
+    float t;            // < 0 means miss
+    float frontFace;    // 1 = ray hit the outer surface, 0 = inside
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+layout(location = 1) rayPayloadEXT float      shadowed;
+
+// ---------------------------------------------------------------------------
+//  PCG random number generator
+// ---------------------------------------------------------------------------
+uint pcg(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float rnd(inout uint state) { return float(pcg(state)) * (1.0 / 4294967296.0); }
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+vec3 skyColor(vec3 d) {
+    float h = 0.5 * (normalize(d).y + 1.0);
+    return mix(vec3(0.90, 0.95, 1.00), vec3(0.25, 0.45, 0.85), h);
+}
+vec3 checker(vec3 p) {
+    float s = floor(p.x) + floor(p.z);
+    return mix(vec3(0.85), vec3(0.10), mod(s, 2.0));
+}
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    vec3 a = abs(n.x) > 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    t = normalize(cross(n, a));
+    b = cross(n, t);
+}
+// Random direction inside a cone of half-angle acos(cosThetaMax) around dir.
+vec3 sampleCone(vec3 dir, float cosThetaMax, inout uint seed) {
+    float u1 = rnd(seed), u2 = rnd(seed);
+    float cosT = mix(1.0, cosThetaMax, u1);
+    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+    float phi  = 6.28318530718 * u2;
+    vec3 t, b; basis(dir, t, b);
+    return normalize(t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + dir * cosT);
+}
+float traceShadow(vec3 origin, vec3 L) {
+    shadowed = 1.0;
+    traceRayEXT(topLevelAS,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFF, 0, 0, 1, origin, 0.001, L, 10000.0, 1);
+    return shadowed;
+}
+
+void main() {
+    uint seed = (gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + cam.frame.x * 26699u) | 1u;
+
+    // Sub-pixel jitter -> anti-aliasing once accumulated.
+    vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+
+    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+
+    vec3  L           = normalize(-cam.lightDir.xyz);
+    int   maxBounces  = int(cam.params.y);
+    float cosThetaMax = cam.params.z;
+    const float eps   = 0.001;
+    const float IOR   = 1.5;
+
+    vec3 color      = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (int bounce = 0; bounce <= maxBounces; ++bounce) {
+        payload.t = 0.0;
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0,
+                    origin, 0.001, dir, 10000.0, 0);
+
+        if (payload.t < 0.0) { color += throughput * skyColor(dir); break; }
+
+        vec3 N   = normalize(payload.normal);
+        int  mat = int(payload.matId + 0.5);
+
+        // ---- Glass: Fresnel-weighted reflect / refract --------------------
+        if (mat == 2) {
+            float eta  = (payload.frontFace > 0.5) ? (1.0 / IOR) : IOR;
+            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
+            float R0   = (1.0 - IOR) / (1.0 + IOR); R0 *= R0;
+            float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
+
+            vec3 refr = refract(dir, N, eta);
+            bool tir  = dot(refr, refr) < 1e-6;
+
+            // Importance-sample the Fresnel term: unbiased, so no reweighting.
+            if (tir || rnd(seed) < fres) {
+                dir    = reflect(dir, N);
+                origin = payload.hitPos + N * eps;
+            } else {
+                dir    = normalize(refr);
+                origin = payload.hitPos - N * eps;
+            }
+            throughput *= vec3(0.95, 0.97, 1.00); // subtle glass tint
+            continue;
+        }
+
+        // ---- Floor / solid object -----------------------------------------
+        vec3 albedo = (mat == 0) ? checker(payload.hitPos) : payload.albedo;
+
+        // Soft shadow: one cone sample per frame; accumulation builds the penumbra.
+        vec3  Ls   = sampleCone(L, cosThetaMax, seed);
+        float sh   = traceShadow(payload.hitPos + N * eps, Ls);
+        float diff = max(dot(N, Ls), 0.0) * (1.0 - sh);
+        vec3  local = albedo * (0.15 + diff);
+
+        float refl = payload.reflectivity;
+        color += throughput * local * (1.0 - refl);
+
+        if (refl <= 0.001) break;
+        throughput *= refl;
+        dir    = reflect(dir, N);
+        origin = payload.hitPos + N * eps;
+    }
+
+    // ---- Temporal accumulation --------------------------------------------
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    vec3 accum;
+    if (cam.frame.x == 0u) {
+        accum = color;
+    } else {
+        vec3 prev = imageLoad(accumImage, pix).rgb;
+        accum = mix(prev, color, 1.0 / float(cam.frame.x + 1u));
+    }
+    imageStore(accumImage, pix, vec4(accum, 1.0));
+
+    vec3 outc = pow(clamp(accum, 0.0, 1.0), vec3(1.0 / 2.2)); // gamma
+    imageStore(outImage, pix, vec4(outc, 1.0));
+}
