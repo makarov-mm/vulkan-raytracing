@@ -150,10 +150,17 @@ vec3 renderSample(inout uint seed, int sampleIdx) {
         vec3  Lc      = toLight / dist;
         float sinMax  = clamp(cam.lightPos.w / dist, 0.0, 0.999);
         float cosMax  = sqrt(1.0 - sinMax * sinMax);
-        vec3  Ls      = sampleCone(Lc, cosMax, seed);
+        float tmax    = dist - cam.lightPos.w * 1.001;
 
-        float sh   = traceShadow(payload.hitPos + N * eps, Ls, dist - cam.lightPos.w * 1.001);
-        float diff = max(dot(N, Ls), 0.0) * (1.0 - sh) * intensity;
+        // Several shadow rays per hit -> smooth penumbra without leaning on accumulation.
+        const int SHADOW_SAMPLES = 4;
+        float diffAcc = 0.0;
+        for (int si = 0; si < SHADOW_SAMPLES; ++si) {
+            vec3  Ls = sampleCone(Lc, cosMax, seed);
+            float sh = traceShadow(payload.hitPos + N * eps, Ls, tmax);
+            diffAcc += max(dot(N, Ls), 0.0) * (1.0 - sh);
+        }
+        float diff  = (diffAcc / float(SHADOW_SAMPLES)) * intensity;
         vec3  local = albedo * (0.12 + diff);
 
         float refl = payload.reflectivity;
@@ -172,9 +179,11 @@ void main() {
 
     vec3 color = vec3(0.0);
     for (int s = 0; s < spp; ++s) {
+        // Seed from the free-running frame counter (frame.y), not the accumulation
+        // counter (frame.x), so the noise still changes frame-to-frame while moving.
         uint seed = (gl_LaunchIDEXT.x * 1973u
                    + gl_LaunchIDEXT.y * 9277u
-                   + (cam.frame.x * uint(spp) + uint(s)) * 26699u) | 1u;
+                   + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
         color += renderSample(seed, s);
     }
     color /= float(spp);

@@ -30,8 +30,8 @@
 // -----------------------------------------------------------------------------
 //  Small helpers
 // -----------------------------------------------------------------------------
-static const uint32_t WIDTH  = 1280;
-static const uint32_t HEIGHT = 720;
+static const uint32_t WIDTH  = 800;
+static const uint32_t HEIGHT = 800;
 
 #ifdef NDEBUG
 static const bool kEnableValidation = false;
@@ -188,7 +188,8 @@ private:
     bool  dragging    = false;
     POINT lastMouse{};
     bool  cameraDirty = true;   // forces an accumulation reset
-    uint32_t accumFrame = 0;
+    uint32_t accumFrame = 0;    // resets on camera move (drives the running average)
+    uint32_t totalFrame = 0;    // never resets (drives RNG decorrelation)
 
     // ---- Core Vulkan ----
     VkInstance       instance = VK_NULL_HANDLE;
@@ -725,8 +726,8 @@ private:
             addSphere(c, 0.8f, palette[i], refl);
         }
 
-        // Visible area light (emissive). Must match lightPos/radius in updateUniforms.
-        addSphere({ 4.0f, 7.0f, -2.0f }, 1.6f, { 1.0f, 0.95f, 0.85f }, 0.0f, 3.0f);
+        // Visible area light (emissive). Radius must match lightPos[3] in updateUniforms.
+        addSphere({ 4.0f, 7.0f, -2.0f }, 1.2f, { 1.0f, 0.95f, 0.85f }, 0.0f, 3.0f);
 
         indexCount = (uint32_t)sceneIndices.size();
 
@@ -1180,6 +1181,7 @@ private:
         // Reset accumulation whenever the camera changed; otherwise keep adding samples.
         if (cameraDirty) { accumFrame = 0; cameraDirty = false; }
         else             { accumFrame++; }
+        totalFrame++;   // always advances, so the RNG keeps moving even during motion
 
         Vec3 center{ 0.0f, 1.0f, 0.0f };
         Vec3 up{ 0.0f, 1.0f, 0.0f };
@@ -1197,12 +1199,13 @@ private:
         data.viewInverse = inverse(view);
         data.projInverse = inverse(proj);
         data.lightPos[0] = 4.0f; data.lightPos[1] = 7.0f; data.lightPos[2] = -2.0f;
-        data.lightPos[3] = 1.6f;      // light sphere radius (bigger = softer shadows)
+        data.lightPos[3] = 1.2f;      // light sphere radius (bigger = softer shadows)
         data.params[0] = t;
         data.params[1] = 8.0f;        // max bounces (glass needs a few)
         data.params[2] = 1.4f;        // light intensity
         data.params[3] = 6.0f;        // samples/frame (multiple of 3 for even dispersion)
         data.frame[0]  = accumFrame;
+        data.frame[1]  = totalFrame;
         uploadToBuffer(ubo, &data, sizeof(data));
     }
 
