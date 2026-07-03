@@ -100,3 +100,9 @@ shaders/shadow.rmiss         shadow miss (point is lit)
   the light radius (`lightPos[3]` — bigger = softer shadows), the intensity, and
   `params[3]`, the number of samples cast per frame (raise it for smoother motion,
   lower it for more speed on weaker GPUs).
+
+## Support
+
+If you found this project interesting or useful, you can support my work:
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/makarov-mm?style=flat&logo=github)](https://github.com/sponsors/makarov-mm)
