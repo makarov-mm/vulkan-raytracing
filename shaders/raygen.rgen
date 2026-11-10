@@ -1,204 +1,200 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
 
-layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
-layout(binding = 2, set = 0) uniform CameraProperties {
-    mat4 viewInverse;
-    mat4 projInverse;
-    vec4 lightPos;   // xyz = position, w = radius (area light)
-    vec4 params;     // x = time, y = maxBounces, z = light intensity, w = samples per frame
-    uvec4 frame;     // x = accumulated frame index (0 on camera move)
-} cam;
-layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
+#include "common.glsl"
 
-struct HitPayload {
-    vec3  hitPos;
-    vec3  normal;       // faces against the incoming ray
-    vec3  albedo;
-    float reflectivity;
-    float matId;        // 0 = floor, 1 = solid, 2 = glass, 3 = emissive light
-    float t;            // < 0 means miss
-    float frontFace;    // 1 = ray hit the outer surface, 0 = inside
-};
+layout(set = 0, binding = kBindingScene) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = kBindingOutput, rgba8) uniform writeonly image2D outputImage;
+layout(set = 0, binding = kBindingAccumulation, rgba32f) uniform image2D accumulation;
 
-layout(location = 0) rayPayloadEXT HitPayload payload;
-layout(location = 1) rayPayloadEXT float      shadowed;
+layout(push_constant) uniform PushConstants { FrameConstants frame; };
 
-// Per-channel IOR for chromatic dispersion (exaggerated for visibility).
-const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
+layout(location = 0) rayPayloadEXT HitPayload hit;
+layout(location = 1) rayPayloadEXT uint shadowed;
 
-// ---------------------------------------------------------------------------
-//  PCG random number generator
-// ---------------------------------------------------------------------------
-uint pcg(inout uint state) {
-    state = state * 747796405u + 2891336453u;
+// ---- Look ------------------------------------------------------------------
+const float IOR[3] = float[](1.50, 1.52, 1.54);  // per channel; exaggerated dispersion
+const float GLASS_R0 = 0.0426;                    // Schlick reflectance at normal incidence, ((1 - 1.52) / (1 + 1.52))^2
+const float GLASS_TRANSMITTANCE = 0.98;           // light absorption per glass interaction
+const float LIGHT_INTENSITY = 1.4;                // direct light on diffuse surfaces
+const float LIGHT_EMISSION = 3.0;                 // brightness of the visible light sphere
+const float AMBIENT = 0.12;
+const int SHADOW_SAMPLES = 4;                     // shadow rays per diffuse hit
+
+const float RAY_EPSILON = 1e-3;
+const float RAY_TMAX = 1e4;
+
+// ---- Random numbers (PCG, Jarzynski & Olano 2020) --------------------------
+
+uint pcgStep(uint state) {
+    return state * 747796405u + 2891336453u;
+}
+
+uint pcgOutput(uint state) {
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
-float rnd(inout uint state) { return float(pcg(state)) * (1.0 / 4294967296.0); }
 
-// ---------------------------------------------------------------------------
-//  Helpers
-// ---------------------------------------------------------------------------
-vec3 skyColor(vec3 d) {
-    float h = 0.5 * (normalize(d).y + 1.0);
-    return mix(vec3(0.90, 0.95, 1.00), vec3(0.25, 0.45, 0.85), h);
+uint pcgHash(uint v) {
+    return pcgOutput(pcgStep(v));
 }
+
+// Uniform float in [0, 1).
+float random(inout uint state) {
+    state = pcgStep(state);
+    return float(pcgOutput(state) >> 8u) * (1.0 / 16777216.0);
+}
+
+// ---- Helpers ---------------------------------------------------------------
+
+vec3 sky(vec3 dir) {
+    return mix(vec3(0.90, 0.95, 1.00), vec3(0.25, 0.45, 0.85), 0.5 * (dir.y + 1.0));
+}
+
 vec3 checker(vec3 p) {
-    float s = floor(p.x) + floor(p.z);
-    return mix(vec3(0.85), vec3(0.10), mod(s, 2.0));
+    return mix(vec3(0.85), vec3(0.10), mod(floor(p.x) + floor(p.z), 2.0));
 }
+
+float pow5(float x) {
+    float x2 = x * x;
+    return x2 * x2 * x;
+}
+
+// Orthonormal basis around a unit vector (Duff et al. 2017).
 void basis(vec3 n, out vec3 t, out vec3 b) {
-    vec3 a = abs(n.x) > 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
-    t = normalize(cross(n, a));
-    b = cross(n, t);
-}
-// Random direction inside a cone of half-angle acos(cosThetaMax) around dir.
-vec3 sampleCone(vec3 dir, float cosThetaMax, inout uint seed) {
-    float u1 = rnd(seed), u2 = rnd(seed);
-    float cosT = mix(1.0, cosThetaMax, u1);
-    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
-    float phi  = 6.28318530718 * u2;
-    vec3 t, b; basis(dir, t, b);
-    return normalize(t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + dir * cosT);
-}
-float traceShadow(vec3 origin, vec3 L, float tmax) {
-    shadowed = 1.0;
-    traceRayEXT(topLevelAS,
-        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        0xFF, 0, 0, 1, origin, 0.001, L, tmax, 1);
-    return shadowed;
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = vec3(c, s + n.y * n.y * a, -n.y);
 }
 
-// ---------------------------------------------------------------------------
-//  Trace one full path for one (jittered) sample.
-// ---------------------------------------------------------------------------
-vec3 renderSample(inout uint seed, int sampleIdx) {
-    vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
-    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
-    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
-    vec2 d      = inUV * 2.0 - 1.0;
+// Uniform direction inside the cone of half-angle acos(cosMax) around `axis`.
+vec3 sampleCone(vec3 axis, float cosMax, inout uint rng) {
+    float cosTheta = mix(1.0, cosMax, random(rng));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 6.28318531 * random(rng);
+    vec3 t, b;
+    basis(axis, t, b);
+    return normalize((t * cos(phi) + b * sin(phi)) * sinTheta + axis * cosTheta);
+}
 
-    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
-    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
-    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+bool occluded(vec3 origin, vec3 dir, float tMax) {
+    shadowed = 1u;
+    traceRayEXT(scene,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                0xFF, 0, 0, 1, origin, RAY_EPSILON, dir, tMax, 1);
+    return shadowed != 0u;
+}
 
-    int   maxBounces = int(cam.params.y);
-    float intensity  = cam.params.z;
-    const float eps  = 0.001;
+// Diffuse light from the spherical area light: sampling the cone it subtends
+// gives soft shadows whose penumbra widens with the occluder's distance.
+float directLight(vec3 position, vec3 n, inout uint rng) {
+    vec3 toLight = frame.light.xyz - position;
+    float dist = length(toLight);
+    vec3 axis = toLight / dist;
+    float sinMax = min(frame.light.w / dist, 0.999);
+    float cosMax = sqrt(1.0 - sinMax * sinMax);
+    float tMax = max(dist - frame.light.w * 1.001, RAY_EPSILON);  // stop short of the light sphere
+    vec3 origin = position + n * RAY_EPSILON;
 
-    vec3 color      = vec3(0.0);
+    float sum = 0.0;
+    for (int i = 0; i < SHADOW_SAMPLES; ++i) {
+        vec3 l = sampleCone(axis, cosMax, rng);
+        float cosine = dot(n, l);
+        if (cosine > 0.0 && !occluded(origin, l, tMax)) sum += cosine;  // no ray for back-facing samples
+    }
+    return sum / float(SHADOW_SAMPLES) * LIGHT_INTENSITY;
+}
+
+// ---- Path ------------------------------------------------------------------
+
+// One jittered camera path. Refraction is traced for a single "hero" colour
+// channel chosen by the sample index, so consecutive samples cover R, G and B
+// equally and the glass disperses light.
+vec3 tracePath(uint sampleIndex, inout uint rng) {
+    vec2 pixel = vec2(gl_LaunchIDEXT.xy) + vec2(random(rng), random(rng));
+    vec2 ndc = pixel / vec2(gl_LaunchSizeEXT.xy) * 2.0 - 1.0;  // y = -1 at the top row
+    vec3 origin = frame.eye.xyz;
+    vec3 dir = normalize(frame.forward.xyz + ndc.x * frame.right.xyz - ndc.y * frame.up.xyz);
+
+    uint hero = sampleIndex % 3u;
+    bool dispersed = false;
+    vec3 color = vec3(0.0);
     vec3 throughput = vec3(1.0);
 
-    // Spectral channel is fixed per sample (stratified), so over a frame each
-    // R/G/B channel gets an equal share -> dispersion with no channel noise.
-    int  hero      = sampleIdx % 3;     // 0 = R, 1 = G, 2 = B
-    bool dispersed = false;
-
-    for (int bounce = 0; bounce <= maxBounces; ++bounce) {
-        payload.t = 0.0;
-        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0,
-                    origin, 0.001, dir, 10000.0, 0);
-
-        if (payload.t < 0.0) { color += throughput * skyColor(dir); break; }
-
-        vec3 N   = normalize(payload.normal);
-        int  mat = int(payload.matId + 0.5);
-
-        // ---- Emissive area light: see the source directly ------------------
-        if (mat == 3) {
-            color += throughput * payload.albedo * 3.0;
+    for (uint bounce = 0u; bounce <= frame.counters.w; ++bounce) {
+        traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, origin, RAY_EPSILON, dir, RAY_TMAX, 0);
+        if (hit.t < 0.0) {
+            color += throughput * sky(dir);
             break;
         }
 
-        // ---- Glass: dispersive Fresnel reflect / refract ------------------
-        if (mat == 2) {
-            float ior = (hero == 0) ? IOR_R : (hero == 1) ? IOR_G : IOR_B;
-            float eta = (payload.frontFace > 0.5) ? (1.0 / ior) : ior;
+        vec3 position = origin + dir * hit.t;
+        vec3 n = hit.normal;
 
-            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
-            float R0   = (1.0 - 1.52) / (1.0 + 1.52); R0 *= R0;
-            float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
+        if (hit.material == kMaterialEmissive) {
+            color += throughput * hit.albedo * LIGHT_EMISSION;
+            break;
+        }
 
-            vec3 refr = refract(dir, N, eta);
-            bool tir  = dot(refr, refr) < 1e-6;
+        if (hit.material == kMaterialGlass) {
+            bool entering = hit.frontFace != 0u;
+            vec3 refracted = refract(dir, n, entering ? 1.0 / IOR[hero] : IOR[hero]);
+            bool totalReflection = dot(refracted, refracted) < 1e-6;
+            // Schlick's approximation needs the angle on the optically thinner
+            // (air) side: the incident one when entering, the refracted one when leaving.
+            float cosine = entering ? clamp(dot(-dir, n), 0.0, 1.0) : clamp(-dot(refracted, n), 0.0, 1.0);
+            float fresnel = totalReflection ? 1.0 : GLASS_R0 + (1.0 - GLASS_R0) * pow5(1.0 - cosine);
 
-            if (tir || rnd(seed) < fres) {
-                dir    = reflect(dir, N);
-                origin = payload.hitPos + N * eps;          // reflection stays full-colour
+            if (random(rng) < fresnel) {
+                dir = reflect(dir, n);  // reflection keeps all colours
+                origin = position + n * RAY_EPSILON;
             } else {
-                dir    = normalize(refr);
-                origin = payload.hitPos - N * eps;
-                if (!dispersed) {                            // collapse to the hero channel
-                    vec3 mask = (hero == 0) ? vec3(1,0,0)
-                              : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
-                    throughput *= 3.0 * mask;
+                dir = normalize(refracted);
+                origin = position - n * RAY_EPSILON;
+                if (!dispersed) {  // from now on the path carries only the hero channel
+                    vec3 mask = vec3(0.0);
+                    mask[hero] = 3.0;
+                    throughput *= mask;
                     dispersed = true;
                 }
             }
-            throughput *= vec3(0.98); // very light absorption
+            throughput *= GLASS_TRANSMITTANCE;
             continue;
         }
 
-        // ---- Floor / solid object -----------------------------------------
-        vec3 albedo = (mat == 0) ? checker(payload.hitPos) : payload.albedo;
+        // Diffuse surface with an optional mirror layer.
+        vec3 albedo = hit.material == kMaterialChecker ? checker(position) : hit.albedo;
+        float reflectivity = hit.reflectivity;
+        color += throughput * albedo * (AMBIENT + directLight(position, n, rng)) * (1.0 - reflectivity);
+        if (reflectivity <= 1e-3) break;
 
-        // Area light: cone subtended by the light sphere -> distance-dependent penumbra.
-        vec3  toLight = cam.lightPos.xyz - payload.hitPos;
-        float dist    = length(toLight);
-        vec3  Lc      = toLight / dist;
-        float sinMax  = clamp(cam.lightPos.w / dist, 0.0, 0.999);
-        float cosMax  = sqrt(1.0 - sinMax * sinMax);
-        float tmax    = dist - cam.lightPos.w * 1.001;
-
-        // Several shadow rays per hit -> smooth penumbra without leaning on accumulation.
-        const int SHADOW_SAMPLES = 4;
-        float diffAcc = 0.0;
-        for (int si = 0; si < SHADOW_SAMPLES; ++si) {
-            vec3  Ls = sampleCone(Lc, cosMax, seed);
-            float sh = traceShadow(payload.hitPos + N * eps, Ls, tmax);
-            diffAcc += max(dot(N, Ls), 0.0) * (1.0 - sh);
-        }
-        float diff  = (diffAcc / float(SHADOW_SAMPLES)) * intensity;
-        vec3  local = albedo * (0.12 + diff);
-
-        float refl = payload.reflectivity;
-        color += throughput * local * (1.0 - refl);
-
-        if (refl <= 0.001) break;
-        throughput *= refl;
-        dir    = reflect(dir, N);
-        origin = payload.hitPos + N * eps;
+        throughput *= reflectivity;
+        dir = reflect(dir, n);
+        origin = position + n * RAY_EPSILON;
     }
     return color;
 }
 
 void main() {
-    int spp = max(1, int(cam.params.w));
-
-    vec3 color = vec3(0.0);
-    for (int s = 0; s < spp; ++s) {
-        // Seed from the free-running frame counter (frame.y), not the accumulation
-        // counter (frame.x), so the noise still changes frame-to-frame while moving.
-        uint seed = (gl_LaunchIDEXT.x * 1973u
-                   + gl_LaunchIDEXT.y * 9277u
-                   + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
-        color += renderSample(seed, s);
+    uint samples = max(frame.counters.z, 1u);
+    vec3 sum = vec3(0.0);
+    for (uint s = 0u; s < samples; ++s) {
+        // The frame index never resets, so the noise keeps changing during camera motion.
+        uint sampleIndex = frame.counters.y * samples + s;
+        uint rng = pcgHash(gl_LaunchIDEXT.x + pcgHash(gl_LaunchIDEXT.y + pcgHash(sampleIndex)));
+        sum += tracePath(sampleIndex, rng);
     }
-    color /= float(spp);
+    vec3 color = sum / float(samples);
 
-    // ---- Temporal accumulation --------------------------------------------
-    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
-    vec3 accum;
-    if (cam.frame.x == 0u) {
-        accum = color;
-    } else {
-        vec3 prev = imageLoad(accumImage, pix).rgb;
-        accum = mix(prev, color, 1.0 / float(cam.frame.x + 1u));
+    // Progressive refinement: running average while the camera stands still.
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    uint accumulated = frame.counters.x;
+    if (accumulated > 0u) {
+        color = mix(imageLoad(accumulation, pixel).rgb, color, 1.0 / float(accumulated + 1u));
     }
-    imageStore(accumImage, pix, vec4(accum, 1.0));
-
-    vec3 outc = pow(clamp(accum, 0.0, 1.0), vec3(1.0 / 2.2)); // gamma
-    imageStore(outImage, pix, vec4(outc, 1.0));
+    imageStore(accumulation, pixel, vec4(color, 1.0));
+    imageStore(outputImage, pixel, vec4(pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0));
 }

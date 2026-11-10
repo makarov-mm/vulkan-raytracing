@@ -1,19 +1,12 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
 
-struct HitPayload {
-    vec3  hitPos;
-    vec3  normal;
-    vec3  albedo;
-    float reflectivity;
-    float matId;
-    float t;
-    float frontFace;
-};
+#include "common.glsl"
 
-layout(location = 0) rayPayloadInEXT HitPayload payload;
+layout(location = 0) rayPayloadInEXT HitPayload hit;
 
 void main() {
-    // Negative t signals "no hit"; the ray-gen shader adds the sky colour.
-    payload.t = -1.0;
+    // The ray escaped; the ray-generation shader adds the sky colour.
+    hit.t = -1.0;
 }

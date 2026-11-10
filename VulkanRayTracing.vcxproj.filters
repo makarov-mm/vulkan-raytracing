@@ -4,6 +4,9 @@
     <Filter Include="Source">
       <UniqueIdentifier>{4a1d8b10-1111-4a2b-9c3d-111111111111}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Headers">
+      <UniqueIdentifier>{4a1d8b10-3333-4a2b-9c3d-333333333333}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Shaders">
       <UniqueIdentifier>{4a1d8b10-2222-4a2b-9c3d-222222222222}</UniqueIdentifier>
     </Filter>
@@ -12,8 +15,58 @@
     <ClCompile Include="src\main.cpp">
       <Filter>Source</Filter>
     </ClCompile>
+    <ClCompile Include="src\Renderer.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Scene.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Swapchain.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Vulkan.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\VulkanContext.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Window.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\Camera.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Math.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Renderer.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Scene.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Swapchain.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Vulkan.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\VulkanContext.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Window.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\shared.h">
+      <Filter>Shaders</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\common.glsl">
+      <Filter>Shaders</Filter>
+    </None>
     <None Include="shaders\raygen.rgen">
       <Filter>Shaders</Filter>
     </None>

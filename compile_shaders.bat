@@ -1,6 +1,6 @@
 @echo off
-REM Compile all ray tracing shaders to SPIR-V using the Vulkan SDK's glslangValidator.
-REM Run automatically as a pre-build step, or manually by double-clicking.
+REM Compiles the ray-tracing shaders to SPIR-V with the Vulkan SDK's glslangValidator.
+REM Runs as a pre-build step; it can also be started by hand.
 
 setlocal
 cd /d "%~dp0shaders"
@@ -11,17 +11,13 @@ if not exist %GLSLANG% (
     exit /b 1
 )
 
-echo Compiling shaders with %GLSLANG%
-
 for %%S in (raygen.rgen miss.rmiss shadow.rmiss closesthit.rchit) do (
-    %GLSLANG% --target-env vulkan1.2 -V "%%S" -o "%%S.spv"
+    %GLSLANG% --target-env vulkan1.3 -V "%%S" -o "%%S.spv"
     if errorlevel 1 (
         echo ERROR compiling %%S
         exit /b 1
     )
-    echo   %%S -^> %%S.spv
 )
 
 echo Shaders compiled successfully.
-endlocal
 exit /b 0
